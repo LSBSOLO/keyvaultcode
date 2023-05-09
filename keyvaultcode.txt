@@ -1,0 +1,1032 @@
+<#
+.SYNOPSIS
+  This script has functions to create and update secrets in a given Azure Key Vault (AKV).
+.DESCRIPTION
+  The script features functions which can be used to process a list of AKV parameters and
+  supports the manual or automated update of the same. The main purpose is to feed a
+  list of parameters from the Environments.json to make sure that all parameters are set
+  before an environment is set up.
+
+  The following Source Types are automated (they can be defined as under the Source.Type property of a parameter in Environments.json):
+  - AzureTenantId: Retrieves the ID of the current Azure Tenant
+  - AzureSubscriptionId: Retrieves the ID of the current Azure Subscription
+  - ServicePrincipalId: Retrieves the Application ID of the Service Principal whose display name is provided
+  - ApplicationIdUri: Retrieves the Application ID URI of a given app registered in the AD
+  - ServicePrincipalSecret: Sets the secret of a given Service Principal when it is created using the "ServicePrincipalId" type (this must be configured to run before the secret)
+  - CosmosDbKey: Retrieves Cosmos DB (primary or secondary key)
+  - StorageAccountKey: Retrieves the key of a given Azure Storage Account
+  - StorageAccountConnectionString: Retrieves the connection string of a given Azure Storage Account
+  - AzureFunctionUriWithDefaultFunctionKey: URL of a single Azure function including the default key (provided in the "code" query parameter)
+  - AzureFunctionDefaultFunctionKey: Default key of a single Azure function
+  - AzureFunctionHostKey: Host key (default) for the whole given Azure Function app
+  - ApiManagementSubscriptionKey: Retrieves the key of a given API Management
+  - ServiceBusPrimaryKey: Retrieves the primary key of a Service Bus
+  - ServiceBusPrimaryConnectionString: Retrieves the primary connection string of a Service Bus
+  - AzureSearchKey: Retrieves the key of given Azure Search
+  - FixedValue: Sets a fixed value which included the capability to replace {Environment} dynamically and replace secrets provided with the same {...} syntax
+  - RandomString: Sets a random value (used mainly for passwords, 128 characters)
+.PARAMETER VaultName
+    Name of the Azure Key Vault which must contain "{Environment}" as a placeholder
+.PARAMETER ResourceGroupName
+    Name of the Resource Group which must contain "{Environment}" as a placeholder
+.PARAMETER Environment
+    Environment name (dev, devint, devtest, preprod, prod)
+.PARAMETER SubscriptionId
+    ID of the Subscription
+.PARAMETER SubscriptionName
+    Name of the Subscription (alternative to ID)
+.PARAMETER EnvironmentsJson
+    Location of Environments.json
+.PARAMETER EnforceReconnect
+    Specifies if Azure connection shall be recreated even if it already exists
+.PARAMETER SkipDeletion
+    Skips the manual deletion of all secrets not listed in Environments.json
+.PARAMETER SkipManualUpdate
+    Skips the processing of secrets which are manually entered
+.PARAMETER SkipAutomatedUpdate
+    Skips the processing of secrets which are automatically determined
+.PARAMETER SkipAccessPolicies
+    Skips the processing of access policies
+.PARAMETER DisplayValues
+    Debug switch to compare updated and existing values (automatically suppressed for anything prod related)
+.PARAMETER AdditionalResourcesForAccessPolicies
+    Object ids of resources to add access policies for in the Key Vault (those come in addition to the ones defined in Environments.json)
+.PARAMETER IntegrationSnetName
+    Name of the Integration Subnet
+.PARAMETER IntegrationSnetName
+    Name of the KeyVault Subnet
+.PARAMETER VnetName
+    Name of the Virtual Network
+.PARAMETER PrivateDnsZoneName
+    Name of the Private Dns Zone
+.PARAMETER VirtualNetworkLink
+    Name of the Virtual Network Link
+.PARAMETER KeyVaultPrivateEndpointName
+    Name of the KeyVault Private Endpoint
+.PARAMETER KeyVaultPrivateEndpointConnectionName
+    Name of the KeyVault Private Endpoint Connection
+.PARAMETER KeyVaultDnsZoneGroup
+    Name of the KeyVault Dns Zone Group
+.PARAMETER AllowedIpAddressList
+    List of Allowed Ip Address   
+.PARAMETER LogicAppName
+    LogicApp name (dev, devint, devtest, preprod, prod) 
+
+.INPUTS
+  None.
+.OUTPUTS
+  None.
+.NOTES
+  Version:        1.10
+  Author:         Gautam Kumar
+  Creation Date:  2021-08-27
+
+.EXAMPLE
+  CreateOrUpdateKeyVault.ps1 -VaultName "akv-{Environment}" -ResourceGroupName "{Environment}-we-rg" -Environment dev -EnvironmentsJson "Environments.json" -EnforceReconnect
+#>
+
+[CmdletBinding()]
+Param(
+    [Parameter(Mandatory = $true, HelpMessage = "VaultName of the Key Vault, must contain '{Environment}' placeholder")][string]$VaultName,
+    [Parameter(Mandatory = $true, HelpMessage = "ResourceGroupName of the Resource Group, must contain '{Environment}' placeholder")][string]$ResourceGroupName,
+    [Parameter(Mandatory = $true, HelpMessage = "Environment abbreviation (dev, devint, devtest, preprod, prod)")][string]$Environment,
+    [Parameter(HelpMessage = "Integration Subnet Name")][string]$IntegrationSnetName,
+    [Parameter(HelpMessage = "Key Vault Subnet Name")][string]$KeyVaultSnetName,
+    [Parameter(HelpMessage = "Virtual Network Name")][string]$VnetName,
+    [Parameter(HelpMessage = "Private DNS Zone Name")][string]$PrivateDnsZoneName,
+    [Parameter(HelpMessage = "Virtual Network Link Name")][string]$VirtualNetworkLink,
+    [Parameter(HelpMessage = "Key Vault Private Endpoint Name")][string]$KeyVaultPrivateEndpointName,
+    [Parameter(HelpMessage = "Key Vault Private Endpoint Connection")][string]$KeyVaultPrivateEndpointConnectionName,
+    [Parameter(HelpMessage = "Key Vault DNS Zone Group")][string]$KeyVaultDnsZoneGroup,
+    [Parameter(HelpMessage = "Allowed IP address List")][string]$AllowedIpAddressList,
+    [Parameter(HelpMessage = "ID of the Azure subscription")][string]$SubscriptionId,
+    [Parameter(HelpMessage = "Name of the Azure subscription")][string]$SubscriptionName,
+    [Parameter(HelpMessage = "Location of Environments.json file")][string]$EnvironmentsJson = "..\..\..\..\Environments.json",
+    [Parameter(HelpMessage = "Enforces are reconnect to the Azure account if context is already established")][switch]$EnforceReconnect,
+    [Parameter(HelpMessage = "Skips the (manullay confirmed) deletion of key vault secrets which are not listed in Environments.json")][switch]$SkipDeletion,
+    [Parameter(HelpMessage = "Skips all manual updates of secrets (to be used in pipeline automation)")][switch]$SkipManualUpdate,
+    [Parameter(HelpMessage = "Skips all automated updates of secrets (to be used for example during the initial key vault population")][switch]$SkipAutomatedUpdate,
+    [Parameter(HelpMessage = "Skips processing of access policies")][switch]$SkipAccessPolicies,
+    [Parameter(HelpMessage = "Debug switch to compare updated and existing values (automatically suppressed for anything prod related)")][switch]$DisplayValues,
+    [Parameter(HelpMessage = "Additional resources to be added in the access policies")][string[]]$AdditionalResourcesForAccessPolicies,
+    [Parameter(HelpMessage = "Default location for new resources")][string]$DefaultLocation = "westeurope",
+    [Parameter(Mandatory = $true)][string]$LogicAppName,
+    [Parameter(HelpMessage = "Simulate update without committing the change to the Key Vault")][switch]$WhatIf
+)
+
+Function GetResolvedParameter($Value, $Environment, [switch]$IgnoreError) {
+    if ($Value.ToString().Contains("Environment")) {
+        return $Value.Replace("{Environment}", $Environment)
+    }
+    elseif (-not($IgnoreError)) {
+        Write-Host -ForegroundColor Red ("Parameter '{0}' must contain a placeholder 'Environment', terminating execution)" -f $Value)
+        exit
+    }
+    else {
+        return $Value
+    }
+}
+
+Function ReplaceExpression($ExpressionToSearch, $Expression, $ReplacementValue) {
+    if ($ExpressionToSearch -ne $null) {
+        return $ExpressionToSearch.Replace("{" + $Expression + "}", $ReplacementValue)
+    }
+    else {
+        return $ReplacementValue
+    }
+}
+
+Function IsAutomated($SourceType) {
+    return -not([string]::IsNullOrEmpty($SourceType) -or $SourceType.ToUpper() -contains "MANUAL")
+}
+
+Function GetUpdatedValueAutomatically($VaultName, $Environment, $ResourceGroupName, $ParameterValue, $WhatIf) {
+    if ($ParameterValue.Source.Type -eq "AzureTenantId") {
+        return (ReplaceExpression -ExpressionToSearch $ParameterValue.Source.Name -Expression $ParameterValue.Source.Type -ReplacementValue (Get-AzContext).Subscription.TenantId)
+    }
+    elseif ($ParameterValue.Source.Type -eq "AzureSubscriptionId") {
+        return (ReplaceExpression -ExpressionToSearch $ParameterValue.Source.Name -Expression $ParameterValue.Source.Type -ReplacementValue (Get-AzContext).Subscription.Id)
+    }
+    elseif ($ParameterValue.Source.Type -eq "ServicePrincipalId") {
+        return (GetServicePrincipal -Environment $Environment -ServicePrincipalName $ParameterValue.Source.Name -ResourceGroupName $ResourceGroupName -WhatIf $WhatIf).ApplicationId
+    }
+    elseif ($ParameterValue.Source.Type -eq "ApplicationIdUri") {
+        $application = Get-AzADApplication -DisplayName (GetResolvedParameter -Value $ParameterValue.Source.Name -Environment $Environment -IgnoreError)
+        if ($null -eq $application.IdentifierUris) {
+            return $application.IdentifierUris[0]
+        }
+    }
+    elseif ($ParameterValue.Source.Type -eq "ServicePrincipalSecret") {
+        return GetServicePrincipalSecret -Environment $Environment -ServicePrincipalName $ParameterValue.Source.Name -WhatIf $WhatIf
+    }
+    elseif ($ParameterValue.Source.Type -eq "StorageAccountKey") {
+        return ((Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name (GetResolvedParameter -Value $ParameterValue.Source.Name -Environment $Environment)).Value[0])
+    }
+    elseif ($ParameterValue.Source.Type -eq "CosmosDbKey") {
+        return GetCosmosDbKey -ResourceGroupName $ResourceGroupName -Environment $Environment  -CosmosDbStorageName $ParameterValue.Source.Name -KeyType $ParameterValue.Source.KeyType
+    }
+    elseif ($ParameterValue.Source.Type -eq "StorageAccountConnectionString") {
+        $storageAccountName = GetResolvedParameter -Value $ParameterValue.Source.Name -Environment $Environment
+        $storageAccountKey = (Get-AzStorageAccountKey -ResourceGroupName $ResourceGroupName -Name $storageAccountName).Value[0]
+        return 'DefaultEndpointsProtocol=https;AccountName=' + $storageAccountName + ';AccountKey=' + $storageAccountKey + ';EndpointSuffix=core.windows.net'
+    }
+    elseif ($ParameterValue.Source.Type -eq "AzureFunctionUriWithDefaultFunctionKey") {
+        return (GetSingleAzureFunctionKeyWithUrl -ResourceGroup $ResourceGroupName -FunctionApp (GetResolvedParameter -Value $ParameterValue.Source.FunctionApp -Environment $Environment) -FunctionName $ParameterValue.Source.FunctionName)
+    }
+    elseif ($ParameterValue.Source.Type -eq "AzureFunctionDefaultFunctionKey") {
+        return (GetSingleAzureFunctionKey -ResourceGroup $ResourceGroupName -FunctionApp (GetResolvedParameter -Value $ParameterValue.Source.FunctionApp -Environment $Environment) -FunctionName $ParameterValue.Source.FunctionName)
+    }
+    elseif ($ParameterValue.Source.Type -eq "AzureFunctionHostKey") {
+        return (GetAzureFunctionHostKey -ResourceGroup $ResourceGroupName -FunctionApp (GetResolvedParameter -Value $ParameterValue.Source.Name -Environment $Environment))
+    }
+    elseif ($ParameterValue.Source.Type -eq "ApiManagementSubscriptionKey") {
+        $apiManagementContext = New-AzApiManagementContext -ResourceGroupName $ResourceGroupName -ServiceName (GetResolvedParameter -Value $ParameterValue.Source.Name -Environment $Environment)
+        if ($null -ne $apiManagementContext) {
+            $apimSubsciption = Get-AzApiManagementSubscription -Context $apiManagementContext -ProductId $ParameterValue.Source.ProductId -UserId 1
+            if ($null -ne $apimSubsciption) {
+                return ((Get-AzApiManagementSubscriptionKey -Context $apiManagementContext -SubscriptionId $apimSubsciption.SubscriptionId).PrimaryKey)
+            }
+            else {
+                return $null
+            }
+        }
+        else {
+            return $null
+        }
+    }
+    elseif ($ParameterValue.Source.Type -eq "ServiceBusPrimaryKey") {
+        return ((Get-AzServiceBusKey -Namespace (GetResolvedParameter -Value $ParameterValue.Source.Name -Environment $Environment) -ResourceGroupName $ResourceGroupName -Name $ParameterValue.Source.KeyName).PrimaryKey)
+    }
+    elseif ($ParameterValue.Source.Type -eq "ServiceBusPrimaryConnectionString") {
+        return ((Get-AzServiceBusKey -Namespace (GetResolvedParameter -Value $ParameterValue.Source.Name -Environment $Environment) -ResourceGroupName $ResourceGroupName -Name $ParameterValue.Source.KeyName).PrimaryConnectionString)
+    }
+    elseif ($ParameterValue.Source.Type -eq "AzureSearchKey") {
+        return ((Get-AzSearchAdminKeyPair -ResourceGroupName $ResourceGroupName -ServiceName (GetResolvedParameter -Value $ParameterValue.Source.Name -Environment $Environment)).Primary)
+    }
+    elseif ($ParameterValue.Source.Type -eq "FixedValue") {
+        return ResolveEnvironmentPlaceholderAndSecrets -VaultName $VaultName -Environment $Environment -Value $ParameterValue.Source.Name
+    }
+    elseif ($ParameterValue.Source.Type -eq "RandomString") {
+        return GeneratePassword
+    }
+
+    return ""
+}
+
+Function GeneratePassword($Length = 50) {
+    $randomPassword = ( -Join ((0x30..0x39) + ( 0x21..0x5A) + ( 0x61..0x7A) | Get-Random -Count $Length  | ForEach-Object { [char]$_ }) )
+    $randomPassword = $randomPassword -replace "[^a-zA-Z0-9/!/#/%]", "9"
+    return $randomPassword
+}
+
+Function GetServicePrincipal($Environment, $ServicePrincipalName, $ResourceGroupName, $WhatIf) {
+    $ServicePrincipalName = GetResolvedParameter -Value $ServicePrincipalName -Environment $Environment -IgnoreError
+    $servicePrincipal = Get-AzADServicePrincipal -DisplayName $ServicePrincipalName
+	
+    if ($null -ne $servicePrincipal) {
+        return $servicePrincipal[0].ApplicationId
+    }
+    else {
+        if ($WhatIf) {
+            Write-Host -ForegroundColor Magenta ("Creation of Service Principal {0} simulated due to -WhatIf switch" -f $ServicePrincipalName)
+        }
+        else {
+            # Prepare application parameters
+            $homePage = "https://spn-$ResourceGroupName/"
+            $identifierUris = "https://spn-$ResourceGroupName/$ServicePrincipalName/"
+            $scope = "/subscriptions/$((Get-AzContext).Subscription.Id)/resourcegroups/$ResourceGroupName"
+            $role = "Reader"
+
+            # Create application
+            $application = New-AzADApplication `
+                -DisplayName $ServicePrincipalName `
+                -HomePage $homePage `
+                -IdentifierUris $identifierUris
+
+            # Create Service Principal
+            $servicePrincipal = New-AzADServicePrincipal `
+                -ApplicationId $application.ApplicationId `
+                -DisplayName $ServicePrincipalName `
+                -Scope $scope `
+                -Role $role
+
+            # Create credential
+            $credentialStartDate = Get-Date
+            $secret = ConvertTo-SecureString -AsPlainText -String (GeneratePassword) -Force
+            New-AzADAppCredential `
+                -ApplicationId $application.ApplicationId `
+                -Password $secret `
+                -StartDate $credentialStartDate `
+                -EndDate $credentialStartDate.AddYears(2)
+
+            $global:CreatedSecrets.Add($ServicePrincipalName, $secret)
+
+            Write-Host -ForegroundColor Magenta ("New Application and Service Principal {0} created" -f $ServicePrincipalName)
+
+            return $servicePrincipal
+        }
+    }
+}
+
+Function JoinUri ([uri]$Uri, [string]$ChildPath) {
+    $combinedPath = [system.io.path]::Combine($Uri.AbsoluteUri, $ChildPath)
+    $combinedPath = $combinedPath.Replace('\', '/')
+    return New-Object uri $combinedPath
+}
+
+Function GetServicePrincipalSecret($Environment, $ServicePrincipalName, $WhatIf) {
+    return $global:CreatedSecrets[(GetResolvedParameter -Value $ServicePrincipalName -Environment $Environment -IgnoreError)]
+}
+
+Function ResolveEnvironmentPlaceholderAndSecrets($VaultName, $Value, $Environment) {
+    $resolvedValue = (ReplaceExpression -ExpressionToSearch $Value -Expression "Environment" -ReplacementValue $Environment)
+    $expressions = @()
+
+    $resolvedValue | Select-String -Pattern "({)(.*?)(})" -AllMatches | ForEach-Object { $_.Matches } | ForEach-Object { $expressions += $_.Groups[2].Value }
+
+    foreach ($expression in $expressions) {
+        $resolvedValue = ReplaceSecretParameterIfSecretNotEmpty -VaultName $VaultName -Value $resolvedValue -SecretName $expression
+    }
+
+    return $resolvedValue
+}
+
+Function ReplaceSecretParameterIfSecretNotEmpty($VaultName, $Value, $SecretName) {
+    $secretValue = GetKeyVaultSecretInPlainText -VaultName $VaultName -SecretName $SecretName
+
+    if (-not([string]::IsNullOrEmpty($secretValue))) {
+        return ReplaceExpression -ExpressionToSearch $Value -Expression $SecretName -ReplacementValue $secretValue
+    }
+    else {
+        throw ("Secret {0} not found" -f $SecretName)
+    }
+}
+
+Function GetCosmosDbKey($ResourceGroupName, $Environment, $CosmosDbStorageName, $KeyType) {
+    $keys = Invoke-AzResourceAction -Action listKeys `
+        -ResourceType "Microsoft.DocumentDb/databaseAccounts" -ApiVersion "2015-04-08" `
+        -ResourceGroupName $ResourceGroupName -Name (GetResolvedParameter -Value $CosmosDbStorageName -Environment $Environment) `
+        -Force
+
+    if ($KeyType -ne "Secondary") {
+        return $keys.primaryMasterKey
+    }
+    else {
+        return $keys.secondaryMasterKey
+    }
+}
+
+Function GetSingleAzureFunctionKey($ResourceGroup, $FunctionApp, $FunctionName) {
+    $functionDetails = (InvokeAzureFunctionManagementEndpoint -ResourceGroup $ResourceGroup -FunctionApp $FunctionApp -Endpoint "/admin/functions/$FunctionName/keys")
+    $functionKey = ($functionDetails | Where-Object { $_.keys.name -eq "default" }).keys[0].value
+
+    return $functionKey
+}
+
+Function GetSingleAzureFunctionKeyWithUrl($ResourceGroup, $FunctionApp, $FunctionName) {
+    $functionKey = $null
+    try {
+        $functionKey = GetSingleAzureFunctionKey -ResourceGroup $ResourceGroup -FunctionApp $FunctionApp -FunctionName $FunctionName
+    } 
+    catch {
+        $functionKey = $null
+    }
+
+    if ($functionKey) {
+        return "https://" + $FunctionApp + ".azurewebsites.net/api/" + $FunctionName + "?code=" + $functionKey
+    } else {
+        Write-host ("FunctionKey is empty. Please confirm if the funtion app has acces to the Storage Account and if the default key is available.")
+        return $null
+    }
+}
+
+Function GetAzureFunctionHostKey($ResourceGroup, $FunctionApp) {
+    $results = (InvokeAzureFunctionManagementEndpoint -ResourceGroup $ResourceGroup -FunctionApp $FunctionApp -Endpoint "/admin/host/keys")
+    return ($results | Where-Object { $_.keys.name -eq "default" }).keys[0].value
+}
+
+Function InvokeAzureFunctionManagementEndpoint($ResourceGroup, $FunctionApp, $Endpoint) {
+    # Get access to REST management API for Azure Function
+    $publishingCredentials = Invoke-AzResourceAction -ResourceGroupName $ResourceGroup -ResourceType "Microsoft.Web/sites/config" -ResourceName "$FunctionApp/publishingcredentials" -Action list -Force
+    $authorization = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(("{0}:{1}" -f $publishingCredentials.Properties.PublishingUserName, $publishingCredentials.Properties.PublishingPassword)))
+    $accessToken = Invoke-RestMethod -Uri "https://$FunctionApp.scm.azurewebsites.net/api/functions/admin/token" -Headers @{Authorization = ("Basic {0}" -f $authorization) } -Method GET
+
+    # Get function details from REST management API
+    return Invoke-RestMethod -Method GET -Headers @{Authorization = ("Bearer {0}" -f $accessToken) } -ContentType "application/json" -Uri ("https://$FunctionApp.azurewebsites.net" + $Endpoint)
+}
+
+Function GetPlaceholder() {
+    return "[[PLACEHOLDER]]"
+}
+
+Function IsPlaceholder($Value) {
+    return $Value.ToUpper() -eq (GetPlaceholder)
+}
+
+Function IsPlaceholderOrEmpty($Value) {
+    return (([string]::IsNullOrEmpty($Value) -or (IsPlaceholder -Value $Value)))
+}
+
+Function PrintParameterInfo($ParameterName, $ParameterValue) {
+    Write-Host ("PARAMETER: {0}" -f $ParameterName)
+    Write-Host ("STORED IN: {0}" -f $ParameterValue.StoredIn)
+    Write-Host ("SOURCE TYPE: {0}" -f $ParameterValue.Source.Type)
+    Write-Host ("DESCRIPTION: {0}" -f $ParameterValue.Description)
+}
+
+Function UpdateCertificateInKeyVault($VaultName, $Environment, $CertificateName, $ParameterValue, $CertificateExists, $WhatIf) {
+    if ($CertificateExists) {
+        Write-Host -ForegroundColor Green ("{0} - Certificate not updated in Key Vault as it already exists. Upload a new certificate manually if required." -f $CertificateName)
+    }
+    elseif (-not($WhatIf)) {
+        $sourceType = $ParameterValue.Source.Type
+
+        if ($SourceType -eq "CertStore") {
+            $certificate = Get-ChildItem -path $ParameterValue.Source.Location | Where { $_.FriendlyName -like (ReplaceExpression -ExpressionToSearch $ParameterValue.Source.Name -Expression "Environment" -ReplacementValue $Environment) }
+        }
+
+        if ($certificate -eq $null) {
+            Write-Host -ForegroundColor Yellow "Certificate not imported as it could not be found"
+        }
+        else {
+            $tmpPassword = ConvertTo-SecureString -String Get-Random -AsPlainText -Force
+            Export-PfxCertificate -Cert $certificate -FilePath tmp.pfx -Password $tmpPassword
+            Import-AzKeyVaultCertificate -VaultName $VaultName -Name $CertificateName -FilePath tmp.pfx -Password $tmpPassword
+            Remove-Item tmp.pfx
+            Write-Host -ForegroundColor Green "Certificate imported to Key Vault"
+        }
+    }
+    else {
+        Write-Host -ForegroundColor Magenta "Certificate not updated in Key Vault due to the -WhatIf switch being turned on"
+    }
+}
+
+Function UpdateSecretValueInKeyVault($VaultName, $Environment, $ResourceGroupName, $ParameterName, $ParameterValue, $ParameterExists, $SkipManualUpdate, $SkipAutomatedUpdate, $DisplayValues, $WhatIf) {
+    if (IsAutomated -SourceType $ParameterValue.Source.Type) {
+        UpdateSecretValueInKeyVaultAutomated -VaultName $VaultName -Environment $Environment -ResourceGroupName $ResourceGroupName -ParameterName $ParameterName -ParameterValue $ParameterValue -ParameterExists $ParameterExists -SkipAutomatedUpdate $SkipAutomatedUpdate -DisplayValues $DisplayValues -WhatIf $WhatIf
+    }
+    else {
+        UpdateSecretValueInKeyVaultManual -VaultName $VaultName -ResourceGroupName $ResourceGroupName -ParameterName $ParameterName -ParameterValue $ParameterValue -ParameterExists $ParameterExists -SkipManualUpdate $SkipManualUpdate -DisplayValues $DisplayValues -WhatIf $WhatIf
+    }
+}
+
+Function UpdateSecretValueInKeyVaultManual($VaultName, $ResourceGroupName, $ParameterName, $ParameterValue, $ParameterExists, $SkipManualUpdate, $DisplayValues, $WhatIf) {
+    $updatedValue = ""
+
+    if ($SkipManualUpdate) {
+        Write-Host -ForegroundColor Cyan "Parameter processing skipped because of -SkipManualUpdate switch"
+        return
+    }
+
+    if ($ParameterExists) {
+        $existingValue = GetKeyVaultSecretInPlainText -VaultName $VaultName -SecretName $ParameterName
+    }
+
+    if (-not(IsPlaceholderOrEmpty($existingValue))) {
+        $overrideParameterChoice = Read-Host "Parameter value is already set. Continue and Override (O) / Ignore (Any Key)"
+
+        if ($overrideParameterChoice.ToUpper() -ne "O") {
+            return
+        }
+    }
+
+    $updatedValue = Read-Host "Enter parameter value" -AsSecureString
+
+    StoreSecretValueInKeyVault -VaultName $VaultName -ParameterName $ParameterName -ExistingValue $existingValue -UpdatedValue $updatedValue -Tags $ParameterValue.Tags -DisplayValues $DisplayValues -WhatIf $WhatIf
+}
+
+Function UpdateSecretValueInKeyVaultAutomated($VaultName, $Environment, $ResourceGroupName, $ParameterName, $ParameterValue, $ParameterExists, $SkipAutomatedUpdate, $DisplayValues, $WhatIf) {
+    if ($SkipAutomatedUpdate) {
+        Write-Host -ForegroundColor Cyan "Parameter processing skipped because of -SkipAutomateUpdate switch"
+        return
+    }
+
+    if ($ParameterExists) {
+        $existingValue = GetKeyVaultSecretInPlainText -VaultName $VaultName -SecretName $ParameterName
+    }
+
+    # For random strings the update is skipped unless the existing value is empty or placeholder
+    if ($ParameterValue.Source.Type -eq "RandomString" -and -not(IsPlaceholderOrEmpty($existingValue))) {
+        Write-Host -ForegroundColor Cyan "Parameter processing skipped because it is a random string and already set"
+        return
+    }
+
+    # Skip update if parameter is not placeholder or empty and switch "SkipUpdateIfNotEmpty" is provided
+    if ($ParameterValue.Source.SkipUpdateIfNotEmpty -eq "true" -and -not(IsPlaceholderOrEmpty($existingValue))) {
+        Write-Host -ForegroundColor Cyan "Parameter processing skipped because the secret is already set and SkipUpdateIfNotEmpty is set to true"
+        return
+    }
+
+    $updatedValue = (GetUpdatedValueAutomatically -VaultName $VaultName -Environment $Environment -ResourceGroupName $ResourceGroupName -ParameterValue $ParameterValue -WhatIf $WhatIf)
+
+    # For Service Principal secrets the update is skipped if no secret could be found
+    if ($ParameterValue.Source.Type -eq "ServicePrincipalSecret" -and [string]::IsNullOrEmpty($updatedValue)) {
+        Write-Host -ForegroundColor Cyan "Parameter processing skipped because it is a Service Principal secret which can only be set once when the Service Principal is created"
+        return
+    }
+    # For Azure Function secrets the update is skipped if no secret could be found
+    if ($ParameterValue.Source.Type.StartsWith('AzureFunction') -and [string]::IsNullOrEmpty($updatedValue)) {
+        Write-Host -ForegroundColor Cyan "Parameter processing skipped because it is a AzureFunction secret which can only be set once when the AzureFunction is created"
+        return
+    }
+    StoreSecretValueInKeyVault -VaultName $VaultName -ParameterName $ParameterName -ExistingValue $existingValue -UpdatedValue $updatedValue -Tags $ParameterValue.Tags -DisplayValues $DisplayValues -WhatIf $WhatIf 
+
+    }
+
+Function StoreSecretValueInKeyVault($VaultName, $ParameterName, $ExistingValue, $UpdatedValue, $Tags, $DisplayValues, $WhatIf) {
+    if ([string]::IsNullOrEmpty($UpdatedValue)) {
+        $UpdatedValue = GetPlaceholder
+    }
+    
+    if ($UpdatedValue -ne $ExistingValue) {
+        # Convert updated value to secure string if required
+        if ($UpdatedValue.GetType().Name -ne "SecureString") {
+            $UpdatedValueSecure = ConvertTo-SecureString -String $UpdatedValue -AsPlainText -Force
+        }
+        else {
+            $UpdatedValueSecure = $UpdatedValue
+        }
+
+        if (-not($WhatIf)) {
+            Set-AzKeyVaultSecret -VaultName $VaultName -Name $ParameterName -SecretValue $UpdatedValueSecure -Tags (CreateAndResolveSecretTags -VaultName $VaultName -Tags $Tags)
+        }
+
+        Write-Host -ForegroundColor Magenta ("{0} - Parameter {1} in Key Vault from '{2}' to '{3}'" -f $ParameterName, $(if ($WhatIf) { "update simulated" } else { "updated" }), $(if ($DisplayValues) { $ExistingValue } else { "***" }), $(if ($DisplayValues) { $UpdatedValue } else { "***" }))
+    }
+    else {
+        Write-Host -ForegroundColor Green ("{0} - Parameter not updated in Key Vault as it already has the correct value '{1}'" -f $ParameterName, $(if ($DisplayValues) { $ExistingValue } else { "***" }))
+    }
+}
+
+Function GetKeyVaultSecretInPlainText($VaultName, $SecretName) {
+    $secret = Get-AzKeyVaultSecret -VaultName $VaultName -Name $SecretName -ErrorAction Stop
+	
+    return GetPlainTextFromSecureString -SecureString $secret.SecretValue
+}
+
+Function GetPlainTextFromSecureString($secureString) {
+    $binaryString = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureString)
+    $plainText = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($binaryString)
+
+    return $plainText
+}
+
+Function CreateAndResolveSecretTags($VaultName, $Tags) {
+    $tagCollection = @{ }
+
+    foreach ($tag in $Tags) {
+        $tagName = ResolveEnvironmentPlaceholderAndSecrets -VaultName $VaultName -Value $tag.Name
+        $tagValue = ResolveEnvironmentPlaceholderAndSecrets -VaultName $VaultName -Value $tag.Value
+        $tagCollection.Add($tagName, $tagValue)
+    }
+
+    return $tagCollection
+}
+
+Function ReuseExistingAzureConnectionOrReconnect($EnforceReconnect) {
+    if ($EnforceReconnect -eq $true -or (Get-AzContext) -eq $null) {
+        Write-Host "Azure connection does not exist or reconnection required"
+        Connect-AzAccount
+    }
+}
+
+Function GetEnvironmentConfigFromEnvironmentsJson($EnvironmentsJson) {
+    $environmentConfig = Get-Content($EnvironmentsJson) | Out-String | ConvertFrom-Json
+
+    if ($environmentConfig.GlobalParameters -eq $null) {
+        throw "Unspecified parameters in Environments.json (parameter 'GlobalParameters')"
+    }
+
+    if ($environmentConfig.KeyVaultAccessPolicies -eq $null) {
+        throw "Unspecified parameters in Environments.json (parameter 'KeyVaultAccessPolicies')"
+    }
+
+    if ($environmentConfig.RoleAssignments -eq $null) {
+        throw "Unspecified parameters in Environments.json (parameter 'RoleAssignments')"
+    }
+
+    return $environmentConfig
+}
+
+<#
+.SYNOPSIS
+This function removes suffixes not required for the siemens.com Subscription Name.
+.PARAMETER Vault
+    Global VaultName script parameter
+.PARAMETER Subscription
+    Global SubscriptionName script parameter
+#>
+Function Get-WorksSubscriptionName {
+  [OutputType([String])]
+  param(
+    [Parameter(Mandatory = $true)] [String] $Vault,
+    [Parameter(Mandatory = $true)] [String] $Subscription)
+
+  if ($Vault.ToLower().Contains('siecom')) {
+    return $Subscription -creplace '-DEV|-QUA|-PROD', [String]::Empty
+  }
+  else {
+    return $Subscription
+  }
+}
+
+Function SetContextToSubscription($SubscriptionId, $SubscriptionName) {
+    Write-Host ("Setting Subscription ...")
+
+    if (-not([string]::IsNullOrEmpty($SubscriptionName))) {
+      Set-AzContext -SubscriptionName (Get-WorksSubscriptionName -Vault $VaultName -Subscription $SubscriptionName) | Out-Null
+    }
+    elseif (-not([string]::IsNullOrEmpty($SubscriptionId))) {
+        $SubscriptionName = (Set-AzContext -SubscriptionId $SubscriptionId).Subscription.Name
+    }
+    else {
+        throw "-SubscriptionId or -SubscriptionName must be provided"
+    }
+
+    Write-Host ("Subscription: {0}`n" -f $SubscriptionName)
+
+    return $SubscriptionName
+}
+
+Function EnsureKeyVaultExists($VaultName, $ResourceGroupName, $SubscriptionName, $SkipManualUpdate, $WhatIf) {
+    Write-Host ("Getting Key Vault ...")
+
+    $keyVault = Get-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName
+
+    if ($keyVault -eq $null) {
+        $resourceGroup = Get-AzResourceGroup -Name $ResourceGroupName
+
+        if ($resourceGroup -eq $null) {
+            $confirmation = Read-Host -Prompt ("Resource group '{0}' does not exist, do you want to create it? [y/n]" -f $ResourceGroupName)
+            if ($confirmation.ToLower() -eq "y") {
+                $resourceGroup = New-AzResourceGroup -Name $ResourceGroupName -Location $DefaultLocation
+            }
+            else {
+                throw ("Resource group {0} not found in subscription {1}, please make sure that you are in the right subscription and the resource group exists" -f $ResourceGroupName, $SubscriptionName)
+            }
+        }
+
+        if ($WhatIf) {
+            throw ("Key Vault {0} does not exist and will not be created if the -WhatIf switch is set" -f $VaultName)
+        }
+        else {
+            # For new Key Vaults, soft deletion is already enabled by default
+            New-AzKeyVault -Name $VaultName -ResourceGroupName $ResourceGroupName -Location ($resourceGroup.Location) -EnablePurgeProtection -EnabledForTemplateDeployment
+            Write-Host ("Key Vault created: {0}" -f $VaultName)
+            if (-not([string]::IsNullOrEmpty($VnetName))) {
+                #Add KeyVault behind Vnet
+                AddKeyVaultBehindVnet -VaultName $VaultName -ResourceGroupName $ResourceGroupName -VnetName $VnetName -IntegrationSnetName $IntegrationSnetName -KeyVaultSnetName $KeyVaultSnetName -SubscriptionName $SubscriptionName -keyvaultprivateendpointconnectionname $KeyVaultPrivateEndpointConnectionName -keyvaultprivateendpointname $KeyVaultPrivateEndpointName -privatednszonename $PrivateDnsZoneName -virtualnetworklink $VirtualNetworkLink -keyvaultdnszonegroup $KeyVaultDnsZoneGroup -AllowedIpAddressList $AllowedIpAddressList -LogicAppName $LogicAppName
+            }
+            else {
+                Write-Host ("Vnet name is not provided.")
+            }
+            else {
+                Write-Host ("Key Vault created: {0}" -f $VaultName)
+            }
+        }
+    }
+    else {
+        if (-not($keyVault.EnableSoftDelete)) {
+            # Enable Soft Delete on existing KeyVault
+            ($keyVaultResource = Get-AzResource -ResourceId $keyVault.ResourceId).Properties | Add-Member -MemberType "NoteProperty" -Name "enableSoftDelete" -Value "true"
+            Set-AzResource -ResourceId $keyVaultResource.ResourceId -Properties $keyVaultResource.Properties -Force
+            Write-Host ("SoftDelete enabled on Key Vault: {0}" -f $VaultName)
+        }
+        if (-not($keyVault.EnablePurgeProtection)) {
+            # Enable Purge Protection on existing KeyVault
+            Update-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName -EnablePurgeProtection
+            Write-Host ("PurgeProtection enabled on Key Vault: {0}" -f $VaultName)
+        }
+        else {
+            Write-Host ("Key Vault found: {0}" -f $VaultName)
+        }
+        if (-not([string]::IsNullOrEmpty($VnetName))) {
+            #Add KeyVault behind Vnet
+            AddKeyVaultBehindVnet -VaultName $VaultName -ResourceGroupName $ResourceGroupName -VnetName $VnetName -IntegrationSnetName $IntegrationSnetName -KeyVaultSnetName $KeyVaultSnetName -SubscriptionName $SubscriptionName -keyvaultprivateendpointconnectionname $KeyVaultPrivateEndpointConnectionName -keyvaultprivateendpointname $KeyVaultPrivateEndpointName -privatednszonename $PrivateDnsZoneName -virtualnetworklink $VirtualNetworkLink -keyvaultdnszonegroup $KeyVaultDnsZoneGroup -AllowedIpAddressList $AllowedIpAddressList -LogicAppName $LogicAppName
+        }
+        else {
+            Write-Host ("Vnet name is not provided.")
+        }
+    }
+    Write-Host
+}
+
+Function EnsureAccessPolicies($VaultName, $ResourceGroupName, $Environment, $KeyVaultAccessPolicies, $AdditionalResourcesForAccessPolicies, $SkipAccessPolicies, $WhatIf) {
+    if ($SkipAccessPolicies) {
+        Write-Host ("Processing of access policies is skipped due to -SkipAccessPolicies switch ...")
+    }
+    else {
+        Write-Host ("Ensuring that all access policies are set ...")
+
+        $accessPoliciesForTargetState = @()
+
+        # Get existing policies from Key Vault
+        $existingAccessPolicies = (Get-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName).AccessPolicies
+
+        # Get access policies from Environments.json and resolve Environment
+        foreach ($keyVaultAccessPolicy in $KeyVaultAccessPolicies) {
+            $policyWithResolvedName = $keyVaultAccessPolicy.name.Replace("{Environment}", $Environment)
+            $accessPoliciesForTargetState += $policyWithResolvedName
+            Write-Host ("Targeted Access Policy [Environments.json]: {0}" -f $policyWithResolvedName)
+        }
+
+        # Add additional policies which come as a script parameter
+        if ($AdditionalResourcesForAccessPolicies) {
+            foreach ($resource in $AdditionalResourcesForAccessPolicies) {
+                $accessPoliciesForTargetState += $resource
+                Write-Host ("Targeted Access Policy [Additional Policy]: {0}" -f $resource)
+            }
+        }
+
+        # Try to resolve resources to names if not yet defined as Guid (Id of Service Principal)
+        foreach ($targetedAccessPolicy in $accessPoliciesForTargetState) {
+            if (-not(IsGuid -Value $targetedAccessPolicy)) {
+                # Try to find the resource by name
+                $servicePrincipalForResource = Get-AzADServicePrincipal -DisplayName $targetedAccessPolicy
+
+                if ($servicePrincipalForResource -eq $null) {
+                    Write-Host -ForegroundColor Yellow ("Service Principal for Resource {0} not found" -f $targetedAccessPolicy)
+                    continue
+                }
+                else {
+                    AddAccessPolicyToKeyVaultIfNotExists -VaultName $VaultName -ResourceGroupName $ResourceGroupName -Name $targetedAccessPolicy -Id $servicePrincipalForResource.Id -ExistingAccessPolicies $existingAccessPolicies -WhatIf $WhatIf
+                }
+            }
+            else {
+                AddAccessPolicyToKeyVaultIfNotExists -VaultName $VaultName -ResourceGroupName $ResourceGroupName -Id $targetedAccessPolicy -ExistingAccessPolicies $existingAccessPolicies -WhatIf $WhatIf
+            }
+        }
+    }
+
+    Write-Host
+}
+
+Function AddAccessPolicyToKeyVaultIfNotExists($VaultName, $ResourceGroupName, $Name, $Id, $ExistingAccessPolicies, $WhatIf) {
+    if ($ExistingAccessPolicies.ObjectId -contains $Id) {
+        Write-Host -ForegroundColor Green ("Access Policy for {0} (Name: {1}) already set in Key Vault" -f $Id, $Name)
+    }
+    else {
+        if ($WhatIf) {
+            Write-Host -ForegroundColor Magenta ("Access Policy for {0} (Name: {1}) would be set in Key Vault but is not (-WhatIf switch enabled)" -f $Id, $Name)
+        }
+        else {
+            Set-AzKeyVaultAccessPolicy `
+                -VaultName $VaultName `
+                -ResourceGroupName $ResourceGroupName `
+                -ObjectId $Id `
+                -PermissionsToKeys @("list", "create", "get", "delete") `
+                -PermissionsToSecrets @("get", "list", "set", "delete", "backup", "restore", "recover", "purge") `
+                -PermissionsToCertificates @("get", "list", "delete", "backup", "restore", "recover")
+            Write-Host -ForegroundColor Magenta ("Access Policy for {0} (Name: {1}) set in Key Vault as it was not set before" -f $Id, $Name)
+        }
+    }
+}
+
+Function IsGuid($Value) {
+    try {
+        $guid = [GUID]$Value
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+Function GetAllSecretsFromKeyVaultAndStopInCaseOfError($VaultName) {
+    Write-Host ("Getting Key Vault parameters ...")
+    $secrets = Get-AzKeyVaultSecret -VaultName $VaultName -ErrorAction Stop
+    Write-Host ("Existing secrets: {0}`n" -f ($secrets).Count)
+    return $secrets
+}
+
+Function CreateOrUpdateKeyVaultParameters($VaultName, $Environment, $ResourceGroupName, $GlobalParameters, $Secrets, $DisplayValues, $SkipAutomatedUpdate, $SkipManualUpdate, $WhatIf) {
+    Write-Host "Starting update of parameters ...`n"
+    $skipAllExistingParameters = $false
+    $parameterNames = @()
+    $GlobalParameters.PSObject.Properties | ForEach-Object {
+        Write-Host "******************************************"
+        Write-Host ("PARAMETER GROUP: {0}" -f $_.Name)
+        Write-Host "******************************************`n"
+
+        $_.Value.PSObject.Properties | ForEach-Object {
+            $parameter = $_
+            $parameterNames += $parameter.Name
+
+            PrintParameterInfo -ParameterName $parameter.Name -ParameterValue $parameter.Value
+
+            if ($parameter.Value.StoredIn -eq "KeyVault") {
+                $keyVaultParameterExists = (($Secrets | Where-Object { $_.Name -eq $parameter.Name }).Count -gt 0)
+
+                if ($parameter.Value.Type -eq "Certificate") {
+                    UpdateCertificateInKeyVault -VaultName $VaultName -Environment $Environment -CertificateName $parameter.Name -ParameterValue $parameter.Value -CertificateExists $keyVaultParameterExists -WhatIf $WhatIf
+                }
+                elseif ($parameter.Value.Type -eq "Secret") {
+                    UpdateSecretValueInKeyVault -VaultName $VaultName -Environment $Environment -ResourceGroupName $ResourceGroupName -ParameterName $parameter.Name -ParameterValue $parameter.Value -ParameterExists $keyVaultParameterExists -SkipManualUpdate $SkipManualUpdate -SkipAutomatedUpdate $SkipAutomatedUpdate -DisplayValues $DisplayValues -WhatIf $WhatIf
+                }
+                else {
+                    Write-Host -ForegroundColor Red ("{0} - Parameter type '{1}' is unknown, " -f $parameter.Name, $parameter.Type)
+                }
+            }
+            elseif ($parameter.Value.StoredIn -eq "ReleasePipeline") {
+                Write-Host ("{0} - Parameter is stored in Azure DevOps Pipeline and hence not updated in Key Vault" -f $parameter.Name)
+            }
+            else {
+                Write-Host -ForegroundColor Yellow ("{0} - Parameter seems not to be stored in any known location, check 'StoredIn' parameter" -f $parameter.Name);
+            }
+
+            Write-Host
+        }
+    }
+
+    return $parameterNames
+}
+
+Function EnsureRoleAssignment($ResourceGroupName, $RoleAssignments, $SkipAccessPolicies, $WhatIf) {
+    if ($SkipAccessPolicies) {
+        Write-Host ("Processing of role assignments is skipped due to -SkipAccessPolicies switch ...")
+    }
+    else {
+        Write-Host ("Ensure Role Assignments - start")
+        # Get role assignment from Environments.json and resolve Environment
+        foreach ($roleAssignment in $RoleAssignments) {
+            $resourceNameWithResolvedName = GetResolvedParameter -Value $roleAssignment.ResourceName -Environment $Environment -IgnoreError
+            $assigneeWithResolvedName = GetResolvedParameter -Value $roleAssignment.AssigneeName -Environment $Environment -IgnoreError
+
+            if ($roleAssignment.AssigneeType -eq "ServicePrincipal") {
+                Write-Host ("Processing '{0}' role assignment - start - Assignee: {1}, Component: {2}" -f $roleAssignment.RoleName, $assigneeWithResolvedName, $resourceNameWithResolvedName)
+                $servicePrincipal = Get-AzADServicePrincipal -DisplayName $assigneeWithResolvedName
+                $applicationUri = $servicePrincipal.ServicePrincipalNames -split ","
+                $resourceId = (Get-AzResource -Name $resourceNameWithResolvedName).ResourceId
+                $existingRoleAssignment = Get-AzRoleAssignment -ServicePrincipalName $servicePrincipal.AppId -Scope $resourceId -RoleDefinitionName $roleAssignment.RoleName
+                if ($WhatIf) {
+                    Write-Host -ForegroundColor Magenta ("`t Processing of role assignments for {0} is skipped due to -WhatIf switch is set" -f $resourceNameWithResolve)
+                }
+                else {
+                    $existingRoleAssignmentCount = ($existingRoleAssignment | measure).Count
+                    if ($existingRoleAssignmentCount -eq 0) {
+                        Write-Host -ForegroundColor Green ("`t Adding new Role Assignment '{0}' for {1}" -f $roleAssignment.RoleName, $resourceNameWithResolve)
+                        New-AzRoleAssignment -RoleDefinitionName $roleAssignment.RoleName -ApplicationId $servicePrincipal.AppId -Scope $resourceId					       				       
+                    }
+                    else {                     
+                        Write-Host -ForegroundColor Magenta ("`t Role Assignment for Service Prinicpal already exits in {0}" -f $resourceNameWithResolve)
+					        
+                    }                                    					
+                }
+            }
+        }
+        Write-Host ("Ensure Role Assignments - end")
+    }
+}
+
+Function DeleteObsoleteKeyVaultParameters($VaultName, $Secrets, $UsedParameters, $SkipDeletion, $SkipManualUpdate) {
+    if (-not($SkipDeletion)) {
+        Write-Host "Deleting obsolete secrets with manual confirmation ..."
+        foreach ($secret in $secrets | Where-Object -Property Name -notin $UsedParameters) {
+            if (-not($SkipManualUpdate)) {
+                $deleteParameter = Read-Host ("{0} [not in Global Parameters] - Delete Parameter (D) / Skip (Any Key)" -f $secret.Name)
+
+                if ($deleteParameter.ToUpper() -eq "D") {
+                    Remove-AzKeyVaultSecret -VaultName $VaultName -Name $secret.Name
+                    Write-Host ("{0} - Secret deleted" -f $secret.Name)
+                }
+                else {
+                    Write-Host ("{0} - Deletion of secret skipped" -f $secret.Name)
+                }
+            }
+            else {
+                Write-Host ("{0} - Deletion of secret skipped due to -SkipManualUpdate switch" -f $secret.Name)
+            }
+        }
+    }
+    else {
+        Write-Host "Deletion of secrets with manual confirmation skipped"
+    }
+}
+
+Function EnsureModuleIsInstalled($AvailableModuleName, $ModuleOrPackageNameToDisplay) {
+
+  Write-Host ('Ensure Module Is Installed {0}' -f $AvailableModuleName)
+  if (-not(Get-Module -ListAvailable -Name $AvailableModuleName)) {
+    if ($null -eq $ModuleOrPackageNameToDisplay) {
+      $ModuleOrPackageNameToDisplay = $AvailableModuleName
+    }
+
+    # Install module automatically
+    Write-Host ('Install-Module {0}' -f $AvailableModuleName)
+    Install-Module -Name $AvailableModuleName -Scope CurrentUser -Repository PSGallery -Force
+
+    # Validate again if module is really installed
+    if (-not(Get-Module -ListAvailable -Name $AvailableModuleName)) {
+      throw ("Module '{0}' or the including package is not installed, make sure to install it using the 'Install-Module' or 'Install-Package' command" -f $ModuleOrPackageNameToDisplay)
+    }
+  }
+}
+
+Function AddKeyVaultBehindVnet($VaultName, $ResourceGroupName, $VnetName, $IntegrationSnetName, $KeyVaultSnetName, $SubscriptionName, $KeyVaultPrivateEndpointConnectionName, $KeyVaultPrivateEndpointName, $PrivateDnsZoneName, $VirtualNetworkLink, $KeyVaultDnsZoneGroup, $AllowedIpAddressList, $LogicAppName) {
+    $keyvault = Get-AzKeyVault -VaultName $VaultName -ResourceGroupName $ResourceGroupName
+
+    $SubscriptionId = (Get-AzSubscription -SubscriptionName (Get-WorksSubscriptionName -Vault $VaultName -Subscription $SubscriptionName)).Id
+
+    $vnet = Get-AzVirtualNetwork -ResourceGroupName $ResourceGroupName
+    if (-not([string]::IsNullOrEmpty($logicAppName))) {
+        $logicApp = Get-AzResource -ResourceGroupName $ResourceGroupName -ResourceType Microsoft.Logic/workflows -ResourceName $LogicAppName
+        $logicAppOutboundIps = $logicApp.Properties.endpointsConfiguration.workflow.outgoingIpAddresses
+        $logicAppIps = $null
+        foreach ($item in $logicAppOutboundIps) {
+            $logicAppIps += @($item.address)
+            $ipAddressesToWhiteList = $AllowedIpAddressList.ToString().Split(',') + $logicAppIps
+            #The Update-AzKeyVaultNetworkRuleSet command updates the network rules in effect on the specified key vault
+            Update-AzKeyVaultNetworkRuleSet -InputObject $keyvault  -DefaultAction Deny -Bypass AzureServices -IpAddressRange $ipAddressesToWhiteList
+        }
+    }
+    if (-not([string]::IsNullOrEmpty($vnet))) {
+        $subnets = $IntegrationSnetName, $KeyVaultSnetName
+        foreach ($item in $subnets) {
+            $subnet = Get-AzVirtualNetwork -ResourceGroupName $ResourceGroupName  -Name $VnetName | Get-AzVirtualNetworkSubnetConfig -Name $item
+            if (-not([string]::IsNullOrEmpty($subnet))) {
+                #Adds a rule meant to restrict access to a key vault based on the client's internet address.
+                Add-AzKeyVaultNetworkRule -VaultName $VaultName -VirtualNetworkResourceId $subnet.Id
+            }
+            else {
+                Write-Host ("Subnet {0} not found" -f $item)
+            }
+        }
+       
+        Write-Host ("Network rule updated in the KeyVault {0}" -f $VaultName)
+        # To Create KeyVault private endpoint
+        if (-not([string]::IsNullOrEmpty($KeyVaultPrivateEndpointName))) {
+            CreatePrivateEndPoint -SubscriptionId $SubscriptionId -VaultName $VaultName -VnetName $VnetName -ResourceGroupName $ResourceGroupName -keyvaultprivateendpointconnectionname $KeyVaultPrivateEndpointConnectionName -keyvaultprivateendpointname $KeyVaultPrivateEndpointName -privatednszonename $PrivateDnsZoneName -virtualnetworklink $VirtualNetworkLink -keyvaultdnszonegroup $KeyVaultDnsZoneGroup 
+        }
+        else {
+            Write-Host ("Private Endpoint Name is not provided")
+        }
+    }
+    else {
+        Write-Host ("Virtual Network {0} not found" -f $VnetName)
+    }
+}
+
+Function CreatePrivateEndPoint($SubscriptionId, $VaultName, $VnetName, $ResourceGroupName, $KeyVaultPrivateEndpointConnectionName, $KeyVaultPrivateEndpointName, $PrivateDnsZoneName, $VirtualNetworkLink, $KeyVaultDnsZoneGroup) {
+    Write-Host ("Create Private EndPoint...")
+    # Place virtual network into variable	 
+    $vnetwork = Get-AzVirtualNetwork -ResourceGroupName $ResourceGroupName -Name $VnetName
+    $vsubnet = $vnetwork | Select-Object -ExpandProperty subnets | Where-Object { $_.Name -eq $KeyVaultSnetName }
+    $privateEndpoint = Get-AzPrivateEndpoint -Name $KeyVaultPrivateEndpointName -ResourceGroupName $ResourceGroupName
+    if ([string]::IsNullOrEmpty($privateEndpoint)) {
+        # Create private endpoint connection
+        $privateEndpointConn = New-AzPrivateLinkServiceConnection -Name $KeyVaultPrivateEndpointConnectionName -PrivateLinkServiceId "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.KeyVault/vaults/$VaultName" -GroupId "vault"
+        $privateEndpoint = New-AzPrivateEndpoint `
+            -ResourceGroupName $ResourceGroupName `
+            -Name $KeyVaultPrivateEndpointName `
+            -Location $DefaultLocation `
+            -Subnet $vsubnet `
+            -PrivateLinkServiceConnection $privateEndpointConn `
+            -Force
+        Write-Host ("{0} Private Endpoint created" -f $privateEndpoint)
+    }
+    else {
+        Write-Host ("{0} Private Endpoint Exists" -f $privateEndpoint)
+    }
+  
+    if (-not([string]::IsNullOrEmpty($PrivateDnsZoneName))) { 
+        $dnszone = Get-AzPrivateDnsZone -ResourceGroupName $ResourceGroupName -Name $PrivateDnsZoneName 
+        if ($null -eq $dnszone) {
+            # Create private dns zone
+            $dnszone = New-AzPrivateDnsZone -ResourceGroupName $ResourceGroupName -Name $PrivateDnsZoneName 
+            Write-Host ("{0} Private DNS Zone created" -f $dnszone)
+        }
+        else {
+            Write-Host ("{0} Private DNS Zone Exists" -f $PrivateDnsZoneName)
+        }
+
+        $vlink = Get-AzPrivateDnsVirtualNetworkLink -ResourceGroupName $ResourceGroupName -ZoneName $PrivateDnsZoneName -Name $VirtualNetworkLink
+        if ($null -eq $vlink) {
+            #Create dns network link
+            $vlink = New-AzPrivateDnsVirtualNetworkLink `
+                -ResourceGroupName $ResourceGroupName `
+                -ZoneName $PrivateDnsZoneName `
+                -Name $VirtualNetworkLink `
+                -VirtualNetworkId $vnetwork.Id 
+            Write-Host ("{0} Private DNS Virtual Network Link Created" -f $VirtualNetworkLink)
+        }
+        else {
+            Write-Host ("{0} Private DNS Virtual Network Link Exists" -f $VirtualNetworkLink)
+        }
+        #Create DNS configuration
+        $config = New-AzPrivateDnsZoneConfig -Name $PrivateDnsZoneName -PrivateDnsZoneId $dnszone.ResourceId
+        # Create DNS zone group
+        New-AzPrivateDnsZoneGroup `
+            -ResourceGroupName $ResourceGroupName `
+            -PrivateEndpointName $KeyVaultPrivateEndpointName `
+            -Name $KeyVaultDnsZoneGroup `
+            -PrivateDnsZoneConfig $config `
+            -Force
+    }
+    else {
+        Write-Host ("Private DNS zone Name is not provided")
+    }
+}
+
+Function EnsureRequiredModulesAreInstalled() {
+    Write-Host ("Ensuring Required Modules Are Installed...")
+    EnsureModuleIsInstalled -AvailableModuleName Az.Accounts -ModuleOrPackageNameToDisplay Az
+    EnsureModuleIsInstalled -AvailableModuleName Az.Search
+}
+Function UpdateNetworkRule ($VaultName) {
+		$agentIpAddress = (Invoke-WebRequest -URI https://ipinfo.io/ip).Content
+        Write-Host ("{0} - IP Address" -f $agentIpAddress)
+		Add-AzKeyVaultNetworkRule -VaultName $VaultName -IpAddressRange $agentIpAddress
+}
+
+Function PrintHeader() {
+    $header = @"
+ ___       __   ________  ________  ___  __    ________
+|\  \     |\  \|\   __  \|\   __  \|\  \|\  \ |\   ____\
+\ \  \    \ \  \ \  \|\  \ \  \|\  \ \  \/  /|\ \  \___|_
+ \ \  \  __\ \  \ \  \\\  \ \   _  _\ \   ___  \ \_____  \
+  \ \  \|\__\_\  \ \  \\\  \ \  \\  \\ \  \\ \  \|____|\  \
+   \ \____________\ \_______\ \__\\ _\\ \__\\ \__\____\_\  \
+    \|____________|\|_______|\|__|\|__|\|__| \|__|\_________\
+                                                 \|_________|
+
+
+ ___  __    _______       ___    ___      ___      ___ ________  ___  ___  ___   _________        ________  ________  ________  ___  ________  _________
+|\  \|\  \ |\  ___ \     |\  \  /  /|    |\  \    /  /|\   __  \|\  \|\  \|\  \ |\___   ___\     |\   ____\|\   ____\|\   __  \|\  \|\   __  \|\___   ___\
+\ \  \/  /|\ \   __/|    \ \  \/  / /    \ \  \  /  / | \  \|\  \ \  \\\  \ \  \\|___ \  \_|     \ \  \___|\ \  \___|\ \  \|\  \ \  \ \  \|\  \|___ \  \_|
+ \ \   ___  \ \  \_|/__   \ \    / /      \ \  \/  / / \ \   __  \ \  \\\  \ \  \    \ \  \       \ \_____  \ \  \    \ \   _  _\ \  \ \   ____\   \ \  \
+  \ \  \\ \  \ \  \_|\ \   \/  /  /        \ \    / /   \ \  \ \  \ \  \\\  \ \  \____\ \  \       \|____|\  \ \  \____\ \  \\  \\ \  \ \  \___|    \ \  \
+   \ \__\\ \__\ \_______\__/  / /           \ \__/ /     \ \__\ \__\ \_______\ \_______\ \__\        ____\_\  \ \_______\ \__\\ _\\ \__\ \__\        \ \__\
+    \|__| \|__|\|_______|\___/ /             \|__|/       \|__|\|__|\|_______|\|_______|\|__|       |\_________\|_______|\|__|\|__|\|__|\|__|         \|__|
+                        \|___|/                                                                     \|_________|
+
+"@
+    Clear
+    Write-Host $header
+}
+
+########################################################
+# BEGIN SCRIPT
+########################################################
+
+$global:CreatedSecrets = @{ }
+
+PrintHeader
+EnsureRequiredModulesAreInstalled
+$ErrorActionPreference = 'continue'
+$VaultName = GetResolvedParameter -Value $VaultName -Environment $Environment
+$ResourceGroupName = GetResolvedParameter -Value $ResourceGroupName -Environment $Environment
+$displayValues = $DisplayValues -and (-not($Environment.ToUpper() -contains "PROD"))
+$environmentConfig = GetEnvironmentConfigFromEnvironmentsJson -EnvironmentsJson $EnvironmentsJson
+ReuseExistingAzureConnectionOrReconnect -EnforceReconnect $EnforceReconnect
+# QuickWin - added replace -PROD because for PROD, the Azure subscription name is not equal to the DevOps Connection name, as it is for QUA
+$SubscriptionName = SetContextToSubscription -SubscriptionId $SubscriptionId -SubscriptionName $SubscriptionName.replace('-PROD','')
+EnsureKeyVaultExists -VaultName $VaultName -ResourceGroupName $ResourceGroupName -SubscriptionName $SubscriptionName -SkipManualUpdate $SkipManualUpdate -WhatIf $WhatIf
+UpdateNetworkRule -VaultName $VaultName
+EnsureAccessPolicies -VaultName $VaultName -ResourceGroupName $ResourceGroupName -Environment $Environment -KeyVaultAccessPolicies ($environmentConfig.KeyVaultAccessPolicies) -AdditionalResourcesForAccessPolicies $AdditionalResourcesForAccessPolicies -SkipAccessPolicies $SkipAccessPolicies -WhatIf $WhatIf
+$secrets = GetAllSecretsFromKeyVaultAndStopInCaseOfError -VaultName $VaultName
+$usedParameters = CreateOrUpdateKeyVaultParameters -ResourceGroupName $ResourceGroupName -VaultName $VaultName -Environment $Environment -GlobalParameters ($environmentConfig.GlobalParameters) -Secrets $secrets -DisplayValues $displayValues -SkipAutomatedUpdate $SkipAutomatedUpdate -SkipManualUpdate $SkipManualUpdate -WhatIf $WhatIf
+EnsureRoleAssignment -ResourceGroupName $ResourceGroupName -RoleAssignments ($environmentConfig.RoleAssignments) -SkipAccessPolicies $SkipAccessPolicies -WhatIf $WhatIf
+DeleteObsoleteKeyVaultParameters -VaultName $VaultName -Secrets $secrets -UsedParameters $usedParameters -SkipDeletion $SkipDeletion -SkipManualUpdate $SkipManualUpdate
+########################################################
+# END SCRIPT
+########################################################
